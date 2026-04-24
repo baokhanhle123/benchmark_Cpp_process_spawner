@@ -14,7 +14,7 @@
 
 namespace {
 
-constexpr int kMaxChildren = 10000;
+constexpr int kMaxChildren = 10000000;
 
 struct Args {
     int num = -1;
