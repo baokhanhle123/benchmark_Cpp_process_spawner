@@ -4,12 +4,16 @@
 # Reads /proc/[pid]/schedstat (nanosecond CPU time) and
 # /proc/[pid]/status VmRSS (KB). Per-process cpu_pct is per-core
 # (htop-style: 100% = one fully-busy core, multi-threaded processes
-# can exceed 100%). System-wide cpu_pct is whole-machine (0-100%).
+# can exceed 100%). cpu_pct_machine = cpu_pct / nproc, normalized to
+# whole-machine 0-100% (directly comparable to system cpu_pct).
+# System-wide cpu_pct is whole-machine (0-100%).
 
 set -uo pipefail
 
 HZ="$(getconf CLK_TCK)"
 MEMTOTAL_KB="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
+CPUS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+[[ "$CPUS" -gt 0 ]] || CPUS=1
 
 now_ns() { date +%s%N; }
 
@@ -144,16 +148,19 @@ cmd_proc() {
         -v c1="$c1" -v c2="$c2" -v t1="$t1" -v t2="$t2" \
         -v rss="$rss" -v vmpeak="$vmpeak" -v vmhwm="$vmhwm" \
         -v threads="$threads" -v uptime="$uptime" -v mt="$MEMTOTAL_KB" \
+        -v cpus="$CPUS" \
         'BEGIN {
             dc = c2 - c1; dt = t2 - t1
             cpu = (dt > 0) ? (dc / dt) * 100 : 0
+            cpu_m = (cpus > 0) ? cpu / cpus : cpu
             mem = (mt > 0) ? (rss / mt) * 100 : 0
-            fmt = "%-14s %s\n"
-            printf fmt, "pid:",         pid
-            printf fmt, "comm:",        comm
-            printf fmt, "state:",       state
-            printf fmt, "cpu_pct:",     sprintf("%.4f", cpu)
-            printf fmt, "mem_pct:",     sprintf("%.4f", mem)
+            fmt = "%-18s %s\n"
+            printf fmt, "pid:",             pid
+            printf fmt, "comm:",            comm
+            printf fmt, "state:",           state
+            printf fmt, "cpu_pct:",         sprintf("%.4f", cpu)
+            printf fmt, "cpu_pct_machine:", sprintf("%.4f", cpu_m)
+            printf fmt, "mem_pct:",         sprintf("%.4f", mem)
             printf fmt, "rss_kb:",      rss
             printf fmt, "vm_hwm_kb:",   vmhwm
             printf fmt, "vm_peak_kb:",  vmpeak
@@ -167,7 +174,7 @@ sample_pid() {
     local c1 c2 t1 t2 rss
     c1=$(read_proc_cpu_ns "$pid") || { echo "PID $pid not found" >&2; exit 1; }
     t1=$(now_ns)
-    echo "timestamp_ns,pid,cpu_pct,mem_pct,rss_kb"
+    echo "timestamp_ns,pid,cpu_pct,cpu_pct_machine,mem_pct,rss_kb"
     while true; do
         sleep "$interval"
         c2=$(read_proc_cpu_ns "$pid" 2>/dev/null) || break
@@ -175,11 +182,13 @@ sample_pid() {
         rss=$(read_proc_rss_kb "$pid" 2>/dev/null) || rss=0
         awk -v ts="$t2" -v pid="$pid" -v c1="$c1" -v c2="$c2" \
             -v t1="$t1" -v t2="$t2" -v rss="$rss" -v mt="$MEMTOTAL_KB" \
+            -v cpus="$CPUS" \
             'BEGIN {
                 dc = c2 - c1; dt = t2 - t1
                 cpu = (dt > 0) ? (dc / dt) * 100 : 0
+                cpu_m = (cpus > 0) ? cpu / cpus : cpu
                 mem = (mt > 0) ? (rss / mt) * 100 : 0
-                printf "%s,%s,%.4f,%.4f,%d\n", ts, pid, cpu, mem, rss
+                printf "%s,%s,%.4f,%.4f,%.4f,%d\n", ts, pid, cpu, cpu_m, mem, rss
             }'
         c1=$c2; t1=$t2
     done
@@ -211,7 +220,7 @@ sample_all_python() {
     local interval=$1
     declare -A prev_cpu
     local prev_t curr_t pid c1 c2 rss
-    echo "timestamp_ns,pid,cpu_pct,mem_pct,rss_kb"
+    echo "timestamp_ns,pid,cpu_pct,cpu_pct_machine,mem_pct,rss_kb"
     prev_t=$(now_ns)
     while read -r pid; do
         c1=$(read_proc_cpu_ns "$pid" 2>/dev/null) || continue
@@ -226,12 +235,13 @@ sample_all_python() {
             c1=${prev_cpu[$pid]:-$c2}
             awk -v ts="$curr_t" -v pid="$pid" -v c1="$c1" -v c2="$c2" \
                 -v t1="$prev_t" -v t2="$curr_t" -v rss="$rss" \
-                -v mt="$MEMTOTAL_KB" \
+                -v mt="$MEMTOTAL_KB" -v cpus="$CPUS" \
                 'BEGIN {
                     dc = c2 - c1; dt = t2 - t1
                     cpu = (dt > 0) ? (dc / dt) * 100 : 0
+                    cpu_m = (cpus > 0) ? cpu / cpus : cpu
                     mem = (mt > 0) ? (rss / mt) * 100 : 0
-                    printf "%s,%s,%.4f,%.4f,%d\n", ts, pid, cpu, mem, rss
+                    printf "%s,%s,%.4f,%.4f,%.4f,%d\n", ts, pid, cpu, cpu_m, mem, rss
                 }'
             prev_cpu[$pid]=$c2
         done < <(list_python_pids)
@@ -263,18 +273,21 @@ Subcommands:
                                     load_1m, load_5m, load_15m
   pids                            List python PIDs (comm matches ^python[0-9.]*\$)
   proc <pid>                      One-shot, labeled (per process):
-                                    pid, comm, state, cpu_pct, mem_pct,
-                                    rss_kb, vm_hwm_kb, vm_peak_kb,
-                                    num_threads, uptime_s
+                                    pid, comm, state, cpu_pct,
+                                    cpu_pct_machine, mem_pct, rss_kb,
+                                    vm_hwm_kb, vm_peak_kb, num_threads,
+                                    uptime_s
   sample <interval_s> <target>    Continuous CSV to stdout (Ctrl+C to stop)
                                   target: <pid> | --system | --all-python
 
 Per-process cpu_pct is per-core (htop convention): 100% = one fully-busy
-core; multi-threaded processes can exceed 100%. System cpu_pct is
-whole-machine (0-100%). CPU is read from /proc/[pid]/schedstat
-(nanosecond resolution). Per-process mem_pct = VmRSS / MemTotal * 100
-(htop convention; shared pages counted in full per process). Memory is
-RSS in KB (per-process) or % of MemTotal (system).
+core; multi-threaded processes can exceed 100%. cpu_pct_machine =
+cpu_pct / nproc, normalized to whole-machine 0-100% (directly comparable
+to system cpu_pct). System cpu_pct is whole-machine (0-100%). CPU is
+read from /proc/[pid]/schedstat (nanosecond resolution). Per-process
+mem_pct = VmRSS / MemTotal * 100 (htop convention; shared pages counted
+in full per process). Memory is RSS in KB (per-process) or % of MemTotal
+(system).
 EOF
 }
 

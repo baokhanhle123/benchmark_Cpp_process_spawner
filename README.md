@@ -105,6 +105,11 @@ chmod +x monitor.sh
   fully-busy core. A multi-threaded CPU-bound process can exceed
   `100%` (e.g. an 8-thread process saturating an 8-core box reads
   ~`800%`). Computed as `Σ_threads(Δ schedstat_ns) / Δ wall_ns × 100`.
+- **Per-process `cpu_pct_machine`** is `cpu_pct / nproc`, normalized to
+  whole-machine `0–100%` of total capacity. Use this when you want a
+  number that is directly comparable to the system `cpu_pct` (the
+  process can never exceed the system reading taken over the same
+  window).
 - **System `cpu_pct`** is whole-machine: `0–100%` of total capacity,
   computed from `/proc/stat` idle vs. total jiffies.
 - **Per-process `mem_pct`** is `VmRSS / MemTotal × 100`, matching htop.
@@ -132,16 +137,17 @@ One-shot per-process reading:
 
 ```
 $ ./monitor.sh proc 383140
-pid:           383140
-comm:          node
-state:         S
-cpu_pct:       0.0998
-mem_pct:       2.0487
-rss_kb:        661664
-vm_hwm_kb:     759684
-vm_peak_kb:    55026568
-num_threads:   13
-uptime_s:      5596.00
+pid:               383140
+comm:              node
+state:             S
+cpu_pct:           0.0998
+cpu_pct_machine:   0.0125
+mem_pct:           2.0487
+rss_kb:            661664
+vm_hwm_kb:         759684
+vm_peak_kb:        55026568
+num_threads:       13
+uptime_s:          5596.00
 ```
 
 Stream a per-process CSV every second:
@@ -150,10 +156,10 @@ Stream a per-process CSV every second:
 $ ./monitor.sh sample 1 383140 > run.csv
 ^C
 $ head run.csv
-timestamp_ns,pid,cpu_pct,mem_pct,rss_kb
-1777185850350071637,383140,2.4405,2.0487,661676
-1777185851356937274,383140,0.0290,2.0487,661676
-1777185852363726573,383140,3.1121,2.0488,661680
+timestamp_ns,pid,cpu_pct,cpu_pct_machine,mem_pct,rss_kb
+1777185850350071637,383140,2.4405,0.3051,2.0487,661676
+1777185851356937274,383140,0.0290,0.0036,2.0487,661676
+1777185852363726573,383140,3.1121,0.3890,2.0488,661680
 ```
 
 Stream system-wide CSV:
@@ -172,7 +178,7 @@ Stream every running Python process at once (CSV with one row per pid per tick):
 ```
 $ ./monitor.sh sample 1 --all-python > python.csv
 $ head python.csv
-timestamp_ns,pid,cpu_pct,mem_pct,rss_kb
+timestamp_ns,pid,cpu_pct,cpu_pct_machine,mem_pct,rss_kb
 ...
 ```
 
@@ -218,7 +224,7 @@ df = pd.read_csv(sys.argv[1])
 # Drop warm-up samples (tune for your workload)
 df = df.iloc[2:]
 
-stats = df[["cpu_pct", "mem_pct"]].agg(
+stats = df[["cpu_pct", "cpu_pct_machine", "mem_pct"]].agg(
     ["mean", "median", "std",
      lambda s: s.quantile(0.95),
      lambda s: s.quantile(0.99)]
@@ -230,12 +236,12 @@ print(stats.to_string(float_format=lambda x: f"{x:.4f}"))
 Example output:
 
 ```
-        cpu_pct  mem_pct
-mean     1.3365   2.0488
-median   1.2705   2.0488
-std      1.3389   0.0000
-p95      2.7920   2.0488
-p99      2.8014   2.0488
+        cpu_pct  cpu_pct_machine  mem_pct
+mean     1.3365           0.1671   2.0488
+median   1.2705           0.1588   2.0488
+std      1.3389           0.1674   0.0000
+p95      2.7920           0.3490   2.0488
+p99      2.8014           0.3502   2.0488
 ```
 
 For the paper, **report the raw summary statistics** (mean ± std, median,
@@ -249,6 +255,8 @@ window-size parameter.
 | Metric | Source | Resolution |
 |---|---|---|
 | Per-process CPU time | `/proc/[pid]/task/*/schedstat` field 1, summed across threads | nanoseconds |
+| Per-process CPU % (per-core) | `Σ_threads(Δ schedstat_ns) / Δ wall_ns × 100` | nanosecond-derived |
+| Per-process CPU % (whole-machine) | per-core value `÷ getconf _NPROCESSORS_ONLN` | nanosecond-derived |
 | Per-process RSS | `/proc/[pid]/status` `VmRSS:` | KB (page-aligned) |
 | Per-process memory % | `VmRSS / MemTotal × 100` | KB-derived |
 | Whole-machine CPU | `/proc/stat` first line (idle + iowait vs. total jiffies) | jiffies (10 ms) |
@@ -258,7 +266,8 @@ window-size parameter.
 Per-process CPU formula (sample window `Δt_wall_ns`):
 
 ```
-cpu_pct = Σ_threads(Δ schedstat_ns) / Δt_wall_ns × 100
+cpu_pct         = Σ_threads(Δ schedstat_ns) / Δt_wall_ns × 100
+cpu_pct_machine = cpu_pct / nproc
 ```
 
 The sum across `task/*/schedstat` is required because schedstat is
@@ -266,6 +275,13 @@ recorded per task (per thread) — for multi-threaded processes, reading
 only the tgid's schedstat misses every worker thread. This is the
 difference between `0%` and `100%` for a Python process whose main
 thread blocks on `time.sleep` while a worker thread burns CPU.
+
+`cpu_pct_machine` exists because `cpu_pct` (per-core) and the system
+`cpu_pct` (whole-machine) use different denominators and are not
+directly comparable. Dividing by `nproc` (`getconf _NPROCESSORS_ONLN`)
+puts the per-process value on the same `0–100%` scale as the system
+reading, so a process can be reported as a fraction of total machine
+capacity.
 
 Per-process memory formula:
 
@@ -290,7 +306,11 @@ Copy-pasteable paragraph for the Methodology section:
 > `/proc/[pid]/task/*/schedstat`) across all threads of the target
 > process, expressed in nanoseconds; CPU utilization is computed as
 > `Δ CPU time / Δ wall time × 100` and reported per-core in the htop
-> convention (`100%` = one fully-busy core). Per-process memory
+> convention (`100%` = one fully-busy core). We additionally report
+> `cpu_pct_machine = cpu_pct / nproc`, the per-process CPU expressed as
+> a fraction of total machine capacity (`0–100%`), to allow direct
+> comparison against the whole-machine reading from `/proc/stat`.
+> Per-process memory
 > utilization is `VmRSS / MemTotal × 100`, where `VmRSS` is read from
 > `/proc/[pid]/status` and `MemTotal` from `/proc/meminfo`. Raw 1 Hz
 > samples are written to CSV with nanosecond timestamps; summary
